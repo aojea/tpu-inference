@@ -172,6 +172,16 @@ contains_element () {
   return 1
 }
 
+## Helper function to extract metrics from log files
+extract_value() {
+  local log_file="$1"
+  local section="$2"
+  local label="$3"  # Mean, Median, or P99
+  
+  grep "$section (ms):" "$log_file" | \
+  awk -v label="$label" '$0 ~ label { print $NF }' || true
+}
+
 # ---------------------------------------------------------
 # DECODE_ONLY Mode Configuration Validation & Dataset Injection
 # ---------------------------------------------------------
@@ -199,6 +209,7 @@ if [[ "${DECODE_ONLY:-false}" == "true" ]]; then
     # Extract configurations from CLIENT_CMD for dataset validations
     DATASET_NAME_VALID="false"
     HAS_DATASET_PATH="false"
+    PERCENTILE_METRICS=""
     for i in "${!CLIENT_CMD[@]}"; do
         arg="${CLIENT_CMD[$i]}"
         if [[ "$arg" == "--dataset-name" && "${CLIENT_CMD[i+1]}" == "custom" ]]; then
@@ -207,6 +218,10 @@ if [[ "${DECODE_ONLY:-false}" == "true" ]]; then
             DATASET_NAME_VALID="true"
         elif [[ "$arg" == "--dataset-path" || "$arg" == --dataset-path=* ]]; then
             HAS_DATASET_PATH="true"
+        elif [[ "$arg" == "--percentile-metrics" ]]; then
+            PERCENTILE_METRICS="${CLIENT_CMD[i+1]}"
+        elif [[ "$arg" == --percentile-metrics=* ]]; then
+            PERCENTILE_METRICS="${arg#*=}"
         fi
     done
 
@@ -240,6 +255,12 @@ if [[ "${DECODE_ONLY:-false}" == "true" ]]; then
     if [[ "$HAS_DATASET_PATH" == "true" ]]; then
         echo "[ERROR] DECODE_ONLY validation failed: Found '--dataset-path' in CLIENT_CMD."
         echo "Reason: DECODE_ONLY dynamically generates and injects its own dataset file. Providing one will cause a conflict."
+        exit 1
+    fi
+
+    if [[ "$PERCENTILE_METRICS" != *"ttft"* ]]; then
+        echo "[ERROR] DECODE_ONLY validation failed: 'ttft' is missing from '--percentile-metrics' in CLIENT_CMD."
+        echo "Reason: TTFT tracking is required to mathematically verify that Prefix Caching successfully bypassed the prefill phase."
         exit 1
     fi
 
@@ -458,6 +479,14 @@ if [[ "${DECODE_ONLY:-false}" == "true" ]]; then
         cat "$LOG_FOLDER/warmup_log.txt"
         exit 1
     fi
+
+    # Extract the TTFT from the warmup phase to validate if the later benchmark hit the prefix cache
+    export WARMUP_TTFT=$(extract_value "$LOG_FOLDER/warmup_log.txt" "TTFT" "Median")
+    if [[ -z "$WARMUP_TTFT" ]]; then
+        echo "[WARN] Failed to extract Median TTFT from warmup log. Cache hit verification will rely on absolute value review."
+    else
+        echo "[INFO] Warmup Median TTFT recorded: ${WARMUP_TTFT} ms"
+    fi
     
     echo "[INFO] Warmup Phase Completed Successfully. Cache is strictly seeded."
     echo "[INFO] Proceeding to Decode-Only concurrency stress testing."
@@ -599,6 +628,35 @@ p99_e2el="$VALID_P99_E2EL"
 
 echo "throughput:$throughput"
 echo "p99_e2el:$p99_e2el"
+
+# Verify if successfully hit the Prefix Cache in Decode-Only mode
+if [[ "${DECODE_ONLY:-false}" == "true" ]]; then
+    BM_TTFT=$(extract_value "$BM_LOG" "TTFT" "Median")
+    
+    if [[ -n "$BM_TTFT" ]]; then
+        if [[ -n "${WARMUP_TTFT:-}" ]]; then
+            # Happy path: WARMUP_TTFT was successfully extracted. 
+            # Execute a strict validation ensuring BM_TTFT is not larger than 50% of WARMUP_TTFT.
+            CACHE_MISS=$(awk -v w="$WARMUP_TTFT" -v b="$BM_TTFT" 'BEGIN { if (b > w * 0.2) print 1; else print 0 }')
+            
+            if [[ "$CACHE_MISS" -eq 1 ]]; then
+                echo "[ERROR] CACHE MISS DETECTED in DECODE_ONLY mode!"
+                echo "Warmup TTFT: ${WARMUP_TTFT} ms | Benchmark TTFT: ${BM_TTFT} ms"
+                echo "Reason: The benchmark phase is re-computing prefill. Prefix Cache was likely evicted."
+                report_and_exit 1
+            else
+                echo "[INFO] Prefix Cache Hit Verified! (Warmup TTFT: ${WARMUP_TTFT} ms -> Benchmark TTFT: ${BM_TTFT} ms)"
+            fi
+        else
+            # Soft fail path: WARMUP_TTFT is missing. 
+            # Print BM_TTFT for manual review of absolute magnitude instead of strict mathematical comparison.
+            echo "[WARN] Could not perform strict cache hit validation (WARMUP_TTFT missing)."
+            echo "[INFO] Benchmark Median TTFT is: ${BM_TTFT} ms. Please review this value to determine if Cache Hit occurred."
+        fi
+    else
+         echo "[WARN] Could not extract Benchmark Median TTFT from BM_LOG. Cache hit verification skipped."
+    fi
+fi
 
 # Step 1.5: check if initial run meets the E2EL requirement
 p99_int=$(printf "%.0f" "$p99_e2el")
